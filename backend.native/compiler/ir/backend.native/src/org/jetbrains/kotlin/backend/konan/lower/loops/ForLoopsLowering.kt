@@ -29,10 +29,18 @@ import org.jetbrains.kotlin.ir.util.*
 import org.jetbrains.kotlin.ir.visitors.*
 import org.jetbrains.kotlin.util.OperatorNameConventions
 
-/**  This lowering pass optimizes range-based for loops. */
+/**  This lowering pass optimizes range-based for loops.
+ *
+ *   NB! not implemented yet.
+ *   Process `for (elem in array) { f(elem) }` construct first.
+ *   Replace with `for (i in array.indices) { f(array.get(i)) }`.
+ *
+ *   Next replace iteration over ranges (X.indices, a..b, etc.) with
+ *   simple while loop over primitive induction variable.
+ */
 internal class ForLoopsLowering(val context: Context) : FileLoweringPass {
     override fun lower(irFile: IrFile) {
-        val transformer = ForLoopsTransformer(context)
+        val transformer = RangeLoopsTransformer(context)
         // Lower loops
         irFile.transformChildrenVoid(transformer)
 
@@ -46,7 +54,7 @@ internal class ForLoopsLowering(val context: Context) : FileLoweringPass {
     }
 }
 
-private class ForLoopsTransformer(val context: Context) : IrElementTransformerVoidWithContext() {
+private class RangeLoopsTransformer(val context: Context) : IrElementTransformerVoidWithContext() {
 
     private val symbols = context.ir.symbols
     private val iteratorToLoopInfo = mutableMapOf<IrVariableSymbol, ForLoopInfo>()
@@ -334,7 +342,7 @@ private class ForLoopsTransformer(val context: Context) : IrElementTransformerVo
         with(context.createIrBuilder(scopeOwnerSymbol, loop.startOffset, loop.endOffset)) {
             // Transform accesses to the old iterator (see visitVariable method). Store loopVariable in loopInfo.
             // Replace not transparent containers with transparent ones (IrComposite)
-            val newBody = loop.body?.transform(this@ForLoopsTransformer, null)?.let {
+            val newBody = loop.body?.transform(this@RangeLoopsTransformer, null)?.let {
                 if (it is IrContainerExpression && !it.isTransparentScope) {
                     IrCompositeImpl(startOffset, endOffset, it.type, it.origin, it.statements)
                 } else {
@@ -359,7 +367,6 @@ private class ForLoopsTransformer(val context: Context) : IrElementTransformerVo
         if (initializer == null || initializer !is IrCall) {
             return super.visitVariable(declaration)
         }
-        // TODO: Add Array processing before
         val result = when (initializer.origin) {
             IrStatementOrigin.FOR_LOOP_ITERATOR -> processHeader(declaration, initializer)
             IrStatementOrigin.FOR_LOOP_NEXT -> processNext(declaration, initializer)
