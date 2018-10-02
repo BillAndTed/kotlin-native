@@ -11,6 +11,8 @@ import org.jetbrains.kotlin.backend.common.lower.DeclarationIrBuilder
 import org.jetbrains.kotlin.backend.common.lower.createIrBuilder
 import org.jetbrains.kotlin.backend.common.lower.irIfThen
 import org.jetbrains.kotlin.backend.konan.Context
+import org.jetbrains.kotlin.backend.konan.irasdescriptors.isSubtypeOf
+import org.jetbrains.kotlin.backend.konan.irasdescriptors.typeWithStarProjections
 import org.jetbrains.kotlin.ir.util.isSimpleTypeWithQuestionMark
 import org.jetbrains.kotlin.builtins.KotlinBuiltIns
 import org.jetbrains.kotlin.ir.IrStatement
@@ -25,8 +27,6 @@ import org.jetbrains.kotlin.ir.types.makeNotNull
 import org.jetbrains.kotlin.ir.types.toKotlinType
 import org.jetbrains.kotlin.ir.util.*
 import org.jetbrains.kotlin.ir.visitors.*
-import org.jetbrains.kotlin.types.typeUtil.isSubtypeOf
-import org.jetbrains.kotlin.types.typeUtil.replaceArgumentsWithStarProjections
 import org.jetbrains.kotlin.util.OperatorNameConventions
 
 /**  This lowering pass optimizes range-based for loops. */
@@ -84,17 +84,18 @@ private class ForLoopsTransformer(val context: Context) : IrElementTransformerVo
         }
     }
 
-    private fun ProgressionInfo.defaultStep(startOffset: Int, endOffset: Int): IrExpression =
-        progressionType.elementType.let { type ->
-            val step = if (increasing) 1 else -1
-            when {
-                KotlinBuiltIns.isInt(type) || KotlinBuiltIns.isChar(type) ->
-                    IrConstImpl.int(startOffset, endOffset, context.irBuiltIns.intType, step)
-                KotlinBuiltIns.isLong(type) ->
-                    IrConstImpl.long(startOffset, endOffset, context.irBuiltIns.longType, step.toLong())
-                else -> throw IllegalArgumentException()
-            }
+    private fun ProgressionInfo.defaultStep(startOffset: Int, endOffset: Int): IrExpression {
+        val type = progressionType.elementType
+        val step = if (increasing) 1 else -1
+        return when {
+            KotlinBuiltIns.isInt(type) || KotlinBuiltIns.isChar(type) ->
+                IrConstImpl.int(startOffset, endOffset, context.irBuiltIns.intType, step)
+            KotlinBuiltIns.isLong(type) ->
+                IrConstImpl.long(startOffset, endOffset, context.irBuiltIns.longType, step.toLong())
+            else -> throw IllegalArgumentException()
         }
+    }
+
 
     private fun irGetProgressionLast(progressionType: ProgressionType,
                                      first: IrVariable,
@@ -117,9 +118,9 @@ private class ForLoopsTransformer(val context: Context) : IrElementTransformerVo
     private fun processHeader(variable: IrVariable, initializer: IrCall): IrStatement? {
         assert(variable.origin == IrDeclarationOrigin.FOR_LOOP_ITERATOR)
         val symbol = variable.symbol
-        val iteratorType = symbols.iterator.descriptor.defaultType.replaceArgumentsWithStarProjections()
+        val iteratorType = symbols.iterator.typeWithStarProjections
 
-        if (!variable.descriptor.type.isSubtypeOf(iteratorType)) {
+        if (!variable.type.isSubtypeOf(iteratorType)) {
             return null
         }
         assert(symbol !in iteratorToLoopInfo)
@@ -358,6 +359,7 @@ private class ForLoopsTransformer(val context: Context) : IrElementTransformerVo
         if (initializer == null || initializer !is IrCall) {
             return super.visitVariable(declaration)
         }
+        // TODO: Add Array processing before
         val result = when (initializer.origin) {
             IrStatementOrigin.FOR_LOOP_ITERATOR -> processHeader(declaration, initializer)
             IrStatementOrigin.FOR_LOOP_NEXT -> processNext(declaration, initializer)

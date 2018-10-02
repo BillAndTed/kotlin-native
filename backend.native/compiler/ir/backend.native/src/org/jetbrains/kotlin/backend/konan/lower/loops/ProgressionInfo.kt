@@ -1,31 +1,39 @@
 package org.jetbrains.kotlin.backend.konan.lower.loops
 
+import org.jetbrains.kotlin.backend.common.IrElementTransformerVoidWithContext
+import org.jetbrains.kotlin.backend.common.lower.createIrBuilder
 import org.jetbrains.kotlin.backend.konan.Context
-import org.jetbrains.kotlin.backend.konan.ir.KonanSymbols
 import org.jetbrains.kotlin.backend.konan.irasdescriptors.isSubtypeOf
+import org.jetbrains.kotlin.backend.konan.irasdescriptors.typeWithoutArguments
 import org.jetbrains.kotlin.builtins.KotlinBuiltIns
-import org.jetbrains.kotlin.descriptors.SimpleFunctionDescriptor
+import org.jetbrains.kotlin.descriptors.*
 import org.jetbrains.kotlin.incremental.components.NoLookupLocation
 import org.jetbrains.kotlin.ir.IrElement
+import org.jetbrains.kotlin.ir.builders.irCall
+import org.jetbrains.kotlin.ir.builders.irCallOp
 import org.jetbrains.kotlin.ir.declarations.IrVariable
 import org.jetbrains.kotlin.ir.expressions.*
 import org.jetbrains.kotlin.ir.expressions.impl.IrCallImpl
 import org.jetbrains.kotlin.ir.expressions.impl.IrCompositeImpl
+import org.jetbrains.kotlin.ir.expressions.impl.IrConstImpl
 import org.jetbrains.kotlin.ir.symbols.IrClassSymbol
 import org.jetbrains.kotlin.ir.symbols.IrFunctionSymbol
 import org.jetbrains.kotlin.ir.types.IrType
 import org.jetbrains.kotlin.ir.types.toKotlinType
+import org.jetbrains.kotlin.ir.util.getPropertyGetter
+import org.jetbrains.kotlin.ir.util.irCallOp
 import org.jetbrains.kotlin.ir.util.referenceFunction
 import org.jetbrains.kotlin.ir.visitors.IrElementVisitor
+import org.jetbrains.kotlin.ir.visitors.transformChildrenVoid
 import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.types.KotlinType
-import org.jetbrains.kotlin.types.SimpleType
-import org.jetbrains.kotlin.types.typeUtil.isSubtypeOf
 import org.jetbrains.kotlin.types.typeUtil.makeNotNullable
+import org.jetbrains.kotlin.util.OperatorNameConventions
 
 
 // TODO: Replace with a cast when such support is added in the boxing lowering.
+// TODO: Use IrType
 internal data class ProgressionType(val elementType: KotlinType, val numberCastFunctionName: Name) {
     fun isIntProgression() = KotlinBuiltIns.isInt(elementType)
     fun isLongProgression() = KotlinBuiltIns.isLong(elementType)
@@ -50,83 +58,107 @@ internal data class ProgressionInfo(
         var needLastCalculation: Boolean = false,
         val closed: Boolean = true)
 
+/**
+ * Gives IR representation of methods, properties and extensions of given [classes].
+ */
+internal class SymbolsProvider(val context: Context, val classes: List<IrClassSymbol>) {
+
+    private val symbols = context.ir.symbols
+
+    fun getMethods(name: String,
+                   filter: (SimpleFunctionDescriptor) -> Boolean = { true }): Set<IrFunctionSymbol> =
+            classes.flatMap { klass ->
+                klass.descriptor.unsubstitutedMemberScope
+                        .getContributedFunctions(Name.identifier(name), NoLookupLocation.FROM_BACKEND)
+                        .filter(filter)
+                        .map { symbols.symbolTable.referenceFunction(it) }
+            }.toSet()
+
+    fun getExtensionFunctions(name: String, pkg: FqName,
+                              filter: (SimpleFunctionDescriptor) -> Boolean = { true }): Set<IrFunctionSymbol> =
+            classes.flatMap { klass ->
+                context.builtIns.builtInsModule.getPackage(pkg).memberScope
+                        .getContributedFunctions(Name.identifier(name), NoLookupLocation.FROM_BACKEND)
+                        .filter(filter)
+                        .map { symbols.symbolTable.referenceFunction(it) }
+            }.toSet()
+
+    // TODO: replace with property
+    fun getExtensionPropertyGetters(name: String, pkg: FqName,
+                                    filter: (PropertyDescriptor) -> Boolean = { true }): Set<IrFunctionSymbol> =
+            classes.flatMap { klass ->
+                context.builtIns.builtInsModule.getPackage(pkg).memberScope
+                        .getContributedVariables(Name.identifier(name), NoLookupLocation.FROM_BACKEND)
+                        .filter(filter)
+                        .map { symbols.symbolTable.referenceFunction(it.getter!!) }
+            }.toSet()
+}
+
+private class ArraySymbolsProvider(val context: Context) {
+    val symbolsProvider = SymbolsProvider(context, listOf(context.ir.symbols.array))
+
+    val indices by lazy { symbolsProvider.getExtensionPropertyGetters("indices", FqName("kotlin.collections")) }
+}
+
 private class ProgressionSymbolsProvider(val context: Context) {
 
     private val symbols = context.ir.symbols
 
-    val rangeToSymbols by lazy { getProgressionBuildingMethods("rangeTo") }
+    val symbolsProvider = SymbolsProvider(context, symbols.integerClasses + symbols.char)
 
-    val untilSymbols by lazy { getProgressionBuildingExtensions("until", FqName("kotlin.ranges")) }
+    val rangeTo by lazy { symbolsProvider.getMethods("rangeTo") }
 
-    val downToSymbols by lazy { getProgressionBuildingExtensions("downTo", FqName("kotlin.ranges")) }
+    val until by lazy { symbolsProvider.getExtensionFunctions("until", FqName("kotlin.ranges")) }
 
-    val stepSymbols by lazy {
-        getExtensionsForProgressionElements("step", FqName("kotlin.ranges")) {
+    val downTo by lazy { symbolsProvider.getExtensionFunctions("downTo", FqName("kotlin.ranges")) }
+
+    val step by lazy {
+        symbolsProvider.getExtensionFunctions("step", FqName("kotlin.ranges")) {
             it.extensionReceiverParameter?.type in symbols.progressionClassesTypes &&
-                    it.valueParameters.size == 1 &&
-                    (KotlinBuiltIns.isLong(it.valueParameters[0].type) || KotlinBuiltIns.isInt(it.valueParameters[0].type))
+                    it.valueParameters.size == 1 && (KotlinBuiltIns.isLong(it.valueParameters[0].type)
+                    || KotlinBuiltIns.isInt(it.valueParameters[0].type))
         }
     }
 
-    private val progressionElementClasses: List<IrClassSymbol> = mutableListOf(symbols.char).apply {
-        addAll(symbols.integerClasses)
-    }
-
-    private val progressionElementClassesTypes: List<SimpleType> = mutableListOf<SimpleType>().apply {
-        progressionElementClasses.mapTo(this) { it.descriptor.defaultType }
-    }
-
-    private val progressionElementClassesNullableTypes: List<SimpleType> = mutableListOf<SimpleType>().apply {
-        progressionElementClassesTypes.mapTo(this) { it.makeNullableAsSpecified(true) }
-    }
-
-    private fun getProgressionBuildingMethods(name: String): Set<IrFunctionSymbol> =
-            getMethodsForProgressionElements(name) {
-                it.valueParameters.size == 1 && it.valueParameters[0].type in progressionElementClassesTypes
-            }
-
-    private fun getProgressionBuildingExtensions(name: String, pkg: FqName): Set<IrFunctionSymbol> =
-            getExtensionsForProgressionElements(name, pkg) {
-                it.extensionReceiverParameter?.type in progressionElementClassesTypes &&
-                        it.valueParameters.size == 1 &&
-                        it.valueParameters[0].type in progressionElementClassesTypes
-            }
-
-    private fun getMethodsForProgressionElements(name: String,
-                                                 filter: (SimpleFunctionDescriptor) -> Boolean): Set<IrFunctionSymbol> =
-            mutableSetOf<IrFunctionSymbol>().apply {
-                progressionElementClasses.flatMapTo(this) { receiver ->
-                    receiver.descriptor.unsubstitutedMemberScope
-                            .getContributedFunctions(Name.identifier(name), NoLookupLocation.FROM_BACKEND)
-                            .filter(filter).map { symbols.symbolTable.referenceFunction(it) }
-                }
-            }
-
-    private fun getExtensionsForProgressionElements(name: String,
-                                                    pkg: FqName,
-                                                    filter: (SimpleFunctionDescriptor) -> Boolean): Set<IrFunctionSymbol> =
-            mutableSetOf<IrFunctionSymbol>().apply {
-                progressionElementClasses.flatMapTo(this) { _ /* receiver */ ->
-                    context.builtIns.builtInsModule.getPackage(pkg).memberScope
-                            .getContributedFunctions(Name.identifier(name), NoLookupLocation.FROM_BACKEND)
-                            .filter(filter).map { symbols.symbolTable.referenceFunction(it) }
-                }
-            }
 }
+
+private fun IrConst<*>.isOne() =
+        when (kind) {
+            IrConstKind.Long -> value as Long == 1L
+            IrConstKind.Int -> value as Int == 1
+            else -> false
+        }
 
 internal class ProgressionInfoBuilder(val context: Context) : IrElementVisitor<ProgressionInfo?, Nothing?> {
 
     private val symbols = context.ir.symbols
 
     private val progressionSymbolsProvider = ProgressionSymbolsProvider(context)
+    private val arraySymbolsProvider = ArraySymbolsProvider(context)
 
     private val intProgression = ProgressionType(context.builtIns.intType, Name.identifier("toInt"))
     private val longProgression = ProgressionType(context.builtIns.longType, Name.identifier("toLong"))
     private val charProgression = ProgressionType(context.builtIns.charType, Name.identifier("toChar"))
 
 
-//    private fun buildIndices(expression: IrCall, progressionType: ProgressionType) =
-//            ProgressionInfo(progressionType)
+    private fun buildIndices(expression: IrCall, progressionType: ProgressionType): ProgressionInfo {
+        val int0 = IrConstImpl.int(expression.startOffset, expression.endOffset, symbols.int.typeWithoutArguments, 0)
+        val int1 = IrConstImpl.int(expression.startOffset, expression.endOffset, symbols.int.typeWithoutArguments, 1)
+
+        val bound = with(context.createIrBuilder(expression.symbol, expression.startOffset, expression.endOffset)) {
+            val size = irCall(symbols.array.getPropertyGetter("size")!!).apply {
+                dispatchReceiver = expression.extensionReceiver
+            }
+            // TODO: What if size is not returning Int?
+            val minusOperator = symbols.getBinaryOperator(
+                    OperatorNameConventions.MINUS,
+                    context.builtIns.intType,
+                    context.builtIns.intType
+            )
+            irCallOp(minusOperator.owner, size, int1)
+        }
+        return ProgressionInfo(progressionType, int0, bound)
+    }
 
     private fun buildRangeTo(expression: IrCall, progressionType: ProgressionType) =
             ProgressionInfo(progressionType,
@@ -182,13 +214,6 @@ internal class ProgressionInfoBuilder(val context: Context) : IrElementVisitor<P
         } to true
     }
 
-    private fun IrConst<*>.isOne() =
-            when (kind) {
-                IrConstKind.Long -> value as Long == 1L
-                IrConstKind.Int -> value as Int == 1
-                else -> false
-            }
-
     // Used only by the assert.
     private fun stepHasRightType(step: IrExpression, progressionType: ProgressionType) =
             ((progressionType.isCharProgression() || progressionType.isIntProgression()) &&
@@ -212,10 +237,11 @@ internal class ProgressionInfoBuilder(val context: Context) : IrElementVisitor<P
 
         // TODO: Process constructors and other factory functions.
         return when (expression.symbol) {
-            in progressionSymbolsProvider.rangeToSymbols -> buildRangeTo(expression, progressionType)
-            in progressionSymbolsProvider.untilSymbols -> buildUntil(expression, progressionType)
-            in progressionSymbolsProvider.downToSymbols -> buildDownTo(expression, progressionType)
-            in progressionSymbolsProvider.stepSymbols -> buildStep(expression, progressionType)
+            in progressionSymbolsProvider.rangeTo   -> buildRangeTo(expression, progressionType)
+            in progressionSymbolsProvider.until     -> buildUntil(expression, progressionType)
+            in progressionSymbolsProvider.downTo    -> buildDownTo(expression, progressionType)
+            in progressionSymbolsProvider.step      -> buildStep(expression, progressionType)
+            in arraySymbolsProvider.indices         -> buildIndices(expression, progressionType)
             else -> null
         }
     }
